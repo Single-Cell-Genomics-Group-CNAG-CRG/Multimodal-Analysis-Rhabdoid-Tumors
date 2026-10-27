@@ -1,6 +1,6 @@
 # MET inhibition exploits conserved regulatory dependencies in malignant rhabdoid tumors
 
-This repository contain Jupyter Notebooks (JN) and corresponding HTML reports in order to reproduce the results from this project. Those will be uploaded progressively in the upcoming weeks. Each folder starting by *AVGUSTINOVA\_\** is a batch of samples of the project:
+This repository contain Jupyter Notebooks (JN) and corresponding HTML reports in order to reproduce the results from this project. Each folder starting by *AVGUSTINOVA\_\** is a batch of samples of the project:
 
 | Patient ID | Multiome Subproject Batch | Visium Subproject Batch |
 | :--- | :--- | :--- |
