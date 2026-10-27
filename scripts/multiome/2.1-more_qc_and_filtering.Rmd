@@ -1,0 +1,447 @@
+---
+title: "2.1-More QC checks and filtering"
+author: "Inés Sentís"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output:
+  html_document:
+    toc: yes
+    toc_float: yes
+    number_sections: yes
+    df_print: paged
+params:
+  subproj: "Default!"
+  patient: "Default!"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE, out.width = "100%", fig.align = "center",
+  message = FALSE, warning = FALSE, fig.width=10, fig.height=5, out.width = "70%"
+)
+options(width = 1200)
+output_dir <- " reports/"
+```
+
+# Introduction
+
+We are going to perform some more quality checks and then apply some filters to remove
+low quality cells 
+
+# Libraries
+
+```{r}
+library(Signac)
+library(Seurat)
+library(tidyverse)
+library(ggplot2)
+library(ggpubr)
+library(gridExtra)
+library(grid)
+```
+
+# Functions
+
+```{r}
+empty_feat <- function(obj) {
+  keep_genes <- data.frame(rowSums(as.matrix(obj[['RNA']]@counts)) != 0)
+  colnames(keep_genes) <- "logical"
+  keep_genes <- subset(keep_genes, logical==TRUE)
+  obj[['RNA']]@counts <- obj[['RNA']]@counts[rownames(keep_genes), ]
+  obj[['RNA']]@data <- obj[['RNA']]@data[rownames(keep_genes), ]
+  return(obj)
+}
+```
+
+
+# Parameters
+
+```{r}
+subproj <- params$subproj
+patient <- params$patient
+
+here::dr_here(show_reason = TRUE)
+source(here::here(glue::glue("{subproj}/multiome_analysis/misc/paths.R")))
+source(here::here("utils/bin.R"))
+
+set.seed(0)
+
+# filters
+max_lib_size_rna <- 45000
+min_lib_size_rna <- 400
+max_n_genes <- 10000
+min_n_genes <- 200
+max_pct_mt <- 20
+max_pct_ribo <- 60
+
+TSS_enrichment <- 1 
+nucleosome_signal_atac <- 2
+min_frag_peak <- 1000
+max_frag_peak <- 25000
+fraction_read_peak <- 0.15
+```
+
+# Load data
+
+```{r}
+seurat_obj <- readRDS(here::here(glue::glue("{qc}/{robj_dir}/2.0_{patient}.rds")))
+seurat_obj@meta.data$caller <- "CellRanger"
+seurat_obj <- SetIdent(seurat_obj, value=seurat_obj@meta.data$caller)
+```
+
+# Apply straightforward general filters
+
+## Filter from cross sensitivity plot 
+```{r fig.height = 6, fig.width = 8, out.width = "100%"}
+
+# these are the cut offs to apply
+x_atac_cutoff <- min(seurat_obj@meta.data[seurat_obj@meta.data$is_cell == 1, "nCount_ATAC"])+10
+y_rna_cutoff <- min(seurat_obj@meta.data[seurat_obj@meta.data$is_cell == 1, "nCount_RNA"])+4
+
+# corss sensitivity plot
+plot_cross_sense(seurat_obj, patient, x_atac_cutoff, y_rna_cutoff)
+```
+
+Apply this general filter before proceeding with the rest of the check metrics
+
+
+```{r}
+seurat_obj <- subset(x = seurat_obj,
+                        nCount_ATAC > x_atac_cutoff & nCount_RNA > y_rna_cutoff)
+```
+
+## Remove empty features
+
+```{r}
+table(rowSums(as.matrix(seurat_obj[['RNA']]@counts)) == 0)
+```
+
+
+```{r}
+seurat_obj <- empty_feat(seurat_obj)
+```
+
+
+## Add quality metrics too
+
+```{r}
+seurat_obj <- quality_metrics(seurat_obj)
+```
+
+# RNA
+
+```{r}
+DefaultAssay(seurat_obj) <- "RNA"
+```
+
+### Library sanity checks
+
+The idea here is to filter any left empty droplet or lysed cells. Hinds to detect a lysed cell are:
+
+  1. total count of UMI low ~ low library size
+  2. total number of genes detected low ~ low library complexity
+  3. high fraction of mitochondrial genes expression (cytosolic mRNA leaks out of the cell)
+
+```{r}
+vlp <- VlnPlot(
+object = seurat_obj,
+features = "nCount_RNA",
+pt.size = 0.1) +  
+scale_y_log10() + 
+geom_hline(yintercept = max_lib_size_rna, linetype='dashed', col = 'black') +
+geom_hline(yintercept = min_lib_size_rna, linetype = "dashed", color = "black") +
+NoLegend()
+
+hist <- plot_histogram_qc(df = seurat_obj@meta.data,
+                        x = "nCount_RNA", 
+                        x_lab = "Library Size (log10(total UMI))")
+hist1 <- hist +
+    scale_x_log10() +
+    geom_vline(xintercept = max_lib_size_rna, 
+              linetype = "dashed", color = "black") +
+    geom_vline(xintercept = min_lib_size_rna, 
+              linetype = "dashed", color = "black")
+
+hist2 <- hist +
+    scale_x_continuous(limits = c(0, 2000)) +
+    xlab("Library Size (total UMI)") +
+    theme_pubr() +
+    geom_vline(xintercept = min_lib_size_rna, linetype = "dashed", color = "black")
+
+grid.arrange(vlp, hist1, hist2, ncol=3, nrow =1,
+             top = textGrob(patient, gp=gpar(fontsize=20,font=3)))
+
+```
+
+## Number of detected genes
+
+```{r}
+vlp <- VlnPlot(
+object = seurat_obj,
+features = "nFeature_RNA",
+pt.size = 0.1) +  
+scale_y_log10() +
+geom_hline(yintercept = max_n_genes, linetype='dashed', col = 'black') +
+geom_hline(yintercept = min_n_genes, linetype = "dashed", color = "black") +
+NoLegend()
+
+hist1 <- plot_histogram_qc(df = seurat_obj@meta.data,
+                          x = "nFeature_RNA", 
+                          x_lab = "Number of Detected Genes") +
+         geom_vline(xintercept = max_n_genes, linetype='dashed', col = 'black') +
+         geom_vline(xintercept = min_n_genes, 
+              linetype = "dashed", color = "black") 
+
+hist2 <- hist1 +
+    scale_x_continuous(limits = c(0, 5000)) +
+    geom_vline(xintercept = min_n_genes, linetype = "dashed", color = "black")
+
+grid.arrange(vlp, hist1, hist2, ncol=3, nrow =1,
+             top = textGrob(patient, gp=gpar(fontsize=20,font=3)))
+```
+
+## Fraction of mitochondrial expression
+
+A reasonable threshold would be to eliminate cells with a % of mitocondrial material above 20
+
+```{r}
+plt1 <- seurat_obj@meta.data %>%
+plot_histogram_qc(x = "pct_mt", x_lab = "% Mitochondrial Expression") +
+geom_vline(xintercept = max_pct_mt, linetype = "dashed", color = "black") +
+scale_x_continuous(limits = c(0, 100)) 
+
+plt2 <- ggplot(seurat_obj@meta.data, aes(x = nCount_RNA, y = nFeature_RNA, color = pct_mt)) +
+  geom_point() + theme_classic() + scale_color_gradient(low = "yellow", high = "red", na.value = NA)
+
+grid.arrange(plt1, plt2, ncol=2, nrow =1,
+             top = textGrob(patient, gp=gpar(fontsize=20,font=3)))
+```
+
+## Fraction of ribosomal expression
+
+```{r}
+plt1 <- seurat_obj@meta.data %>%
+  plot_histogram_qc(x = "pct_ribosomal", x_lab = "% Ribosomal Expression") +
+  geom_vline(xintercept = max_pct_ribo, linetype = "dashed", color = "black") +
+  scale_x_continuous(limits = c(0, 100)) +
+  ggtitle(patient) + 
+  theme(plot.title = element_text(hjust = 0.5))
+plt2 <- ggplot(seurat_obj@meta.data, aes(x = nCount_RNA, y = nFeature_RNA, color = pct_ribosomal)) +
+  geom_point() + theme_classic() + scale_color_gradient(low = "yellow", high = "red", na.value = NA)
+
+grid.arrange(plt1, plt2, ncol=2, nrow =1,
+             top = textGrob(patient, gp=gpar(fontsize=20,font=3)))
+```
+
+
+```{r eval=F, include=F}
+filter_obj <- subset(seurat_obj, subset = pct_ribosomal > 10)
+ggplot(filter_obj@meta.data, aes(x = nCount_RNA, y = nFeature_RNA, color = pct_ribosomal)) +
+  geom_point() + theme_classic() + scale_color_gradient(low = "yellow", high = "red", na.value = NA) +
+  xlim(0,4000) + ylim(0,2000)
+```
+
+
+# ATAC
+
+```{r}
+DefaultAssay(seurat_obj) <- "ATAC"
+```
+
+```{r eval=F}
+keep_peaks <- data.frame(rowSums(as.matrix(seurat_obj[['ATAC']]@counts)) != 0)
+colnames(keep_peaks) <- "logical"
+keep_peaks <- subset(keep_peaks, logical==TRUE)
+seurat_obj[['ATAC']]@counts <- seurat_obj[['ATAC']]@counts[rownames(keep_peaks), ]
+seurat_obj[['ATAC']]@data <- seurat_obj[['ATAC']]@data[rownames(keep_peaks), ]
+```
+
+
+## Library size
+
+```{r}
+vlp <- VlnPlot(
+object = seurat_obj,
+features = "nCount_ATAC",
+pt.size = 0.1) +  
+scale_y_log10() +
+NoLegend() + xlab("Count of peaks") + ggtitle("")
+
+hist <- plot_histogram_qc(df = seurat_obj@meta.data,
+                        x = "nCount_ATAC", 
+                        x_lab = "Library Size (log10)") 
+hist1 <- hist +
+    scale_x_log10() 
+
+hist2 <- hist +
+    scale_x_continuous(limits = c(0, 2000)) +
+    xlab("Library Size") +
+    theme_pubr() 
+
+grid.arrange(vlp, hist1, hist2, ncol=3, nrow =1,
+             top = textGrob(patient, gp=gpar(fontsize=20,font=3)))
+
+```
+
+## Number of peaks
+
+```{r}
+vlp1 <- VlnPlot(
+  object = seurat_obj,
+  features = c('atac_fragments'),
+  pt.size = 0.1,
+  same.y.lims   = TRUE,
+  combine=TRUE,
+) +  NoLegend() + xlab("Number of fragments") + ggtitle("") 
+
+vlp2 <- VlnPlot(
+  object = seurat_obj,
+  features = c('atac_peak_region_fragments'),
+  pt.size = 0.1,
+  same.y.lims   = TRUE,
+  combine=TRUE) + NoLegend() +
+  xlab("Number of fragments in peaks") + ggtitle("") +
+  geom_hline(yintercept = min_frag_peak, 
+              linetype = "dashed", color = "black") +
+  geom_hline(yintercept = max_frag_peak, 
+              linetype = "dashed", color = "black") 
+
+grid.arrange(vlp1, vlp2, ncol=2, nrow =1,
+               top = textGrob(patient, gp=gpar(fontsize=20,font=3)))
+```
+
+## Fraction of reads in peaks (FRiP) 
+
+
+```{r}
+p_cr <- ggplot(seurat_obj@meta.data, aes(x=FRiP)) + 
+  geom_histogram(color="black", fill="white") +
+  ylim(0, 400)
+# plot dispersion
+vpl <- VlnPlot(
+  object = seurat_obj,
+  features = c('FRiP'),
+  pt.size = 0.1,
+  ncol = 2,
+  same.y.lims  = TRUE,
+) + NoLegend() + xlab("FRiP") + ggtitle("") +
+  geom_hline(yintercept = fraction_read_peak, 
+              linetype = "dashed", color = "black") 
+
+
+grid.arrange(p_cr, vpl, ncol=2, nrow =1,
+               top = textGrob(patient, gp=gpar(fontsize=20,font=3)))
+```
+
+## Fragment length distribution and Nucleosome signal
+
+In Signac, to test the quality of the assay one can compute the ratio of the fragments 147 bp and 294 bp (mononucleosome) to fragments < 147 bp (nucleosome-free). This is called the nucleosome signal score and is computed per cell.
+
+```{r}
+nucleo_plot <- function(obj) {
+  f <- FragmentHistogram(obj) + 
+    geom_vline(xintercept  = 147, linetype='dotted', col = 'blue') +
+    geom_vline(xintercept  = 294, linetype='dotted', col = 'red') +
+    annotate(geom="text", x=147/2-20, y=5500, label="Nucleosome free", color="blue") +
+    annotate(geom="text", x=(294-147)/2+147, y=5500, label="Mononucleosome", color="red") 
+
+  NFR <- length(which(f$data$length < 147)) / nrow(f$data) * 100
+  MONO <- length(which(f$data$length > 147 & f$data$length < 294)) / nrow(f$data) * 100
+  DI <- length(which(f$data$length > 294)) / nrow(f$data) * 100
+  
+  f + annotate(geom="text", x = 147/2, y = 80, label = round(NFR, 2), size = 4, color="white") +
+       annotate(geom="text", x = (294-147)/2+147, y = 80, label = round(MONO, 2), size = 4, color="white") +
+       annotate(geom="text", x = 350, y = 80, label = round(DI, 2), size = 4, color="white")
+  f + ggtitle("Fragment length distribution") +
+      theme(plot.title = element_text(hjust = 0.5, size = 16, face = "bold"))
+}
+  
+ncl <- nucleo_plot(seurat_obj)
+vlp <- VlnPlot(
+object = seurat_obj,
+features = "nucleosome_signal",
+pt.size = 0.1) +  
+scale_y_log10() +
+geom_hline(yintercept = nucleosome_signal_atac, linetype='dashed', 
+           col = 'black') + NoLegend()
+
+grid.arrange(ncl, vlp, ncol=2, nrow =1,
+             top = textGrob(patient, gp=gpar(fontsize=20,font=3)),
+             widths=c(3, 1))
+
+```
+
+## Transcriptional start site (TSS) enrichment score
+
+```{r}
+plot_tss <- function(obj){
+ DefaultAssay(obj) <- "ATAC" 
+ Signac::TSSPlot(obj, group.by = "high.tss") + 
+   ggtitle("TSS enrichment score distribution")  +
+      theme(plot.title = element_text(hjust = 0.5, size = 16, face = "bold"))
+}
+
+tss <- plot_tss(seurat_obj)
+vlp <- VlnPlot(
+object = seurat_obj,
+features = "TSS.enrichment",
+pt.size = 0.1) +  
+scale_y_log10() +
+geom_hline(yintercept = TSS_enrichment, linetype='dashed', 
+           col = 'black') + scale_y_log10() + NoLegend()
+
+grid.arrange(tss, vlp, ncol=2, nrow =1,
+             top = textGrob(patient, gp=gpar(fontsize=20,font=3)))
+
+```
+
+# Final application of filters
+
+```{r}
+filtering_QC <- function(seurat_obj) {
+  seurat_obj <- subset(
+    x = seurat_obj, 
+    
+    #rna
+    pct_mt < max_pct_mt &
+    pct_ribosomal < max_pct_ribo &
+    nCount_RNA > min_lib_size_rna &
+    nCount_RNA < max_lib_size_rna &
+    nFeature_RNA < max_n_genes &
+    nFeature_RNA > min_n_genes &
+   
+    #atac
+    atac_peak_region_fragments > min_frag_peak &
+    atac_peak_region_fragments < max_frag_peak &
+    FRiP > fraction_read_peak &
+    nucleosome_signal < nucleosome_signal_atac &
+    TSS.enrichment > TSS_enrichment)
+  return(seurat_obj)
+}
+
+print("Before second filters")
+print(seurat_obj)
+
+# Apply filters
+seurat_obj <- filtering_QC(seurat_obj)
+
+print("After second filters")
+print(seurat_obj)
+
+# Filter genes without counts 
+#seurat_obj <- empty_feat(seurat_obj)
+
+#print("After empty features filters")
+#print(seurat_obj)
+```
+
+# Save clean object
+
+```{r}
+saveRDS(seurat_obj, here::here(glue::glue("{qc}/{robj_dir}/2.1_{patient}.rds")))
+```
+
+# Session Information
+
+```{r}
+sessionInfo()
+```

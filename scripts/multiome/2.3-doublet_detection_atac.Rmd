@@ -1,0 +1,246 @@
+---
+title: "2.3-Find doublets with ArchR"
+author: "Inés Sentís"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output:
+  html_document:
+    toc: yes
+    toc_float: yes
+    number_sections: yes
+    df_print: paged
+params:
+  patient: "Default!"
+  subproj: "Default!"
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE, out.width = "100%", fig.align = "center",
+  message = FALSE, warning = FALSE, fig.width=8, fig.height=6, out.width = "70%"
+)
+options(width = 1200)
+output_dir <- " reports/"
+```
+
+# Introduction  
+
+Detect doublets from scATAC-seq data using [ArchR](https://www.archrproject.com/bookdown/inferring-scatac-seq-doublets-with-archr.html) 
+
+# Library 
+
+```{r}
+library(Signac)
+library(Seurat)
+library(tidyverse)
+library(ggplot2)
+library(GenomicRanges)
+library(ArchR)
+library(stringr)
+library(parallel)
+```
+
+# Parameters
+
+```{r}
+here::dr_here(show_reason = TRUE)
+
+patient <- params$patient
+subproj <- params$subproj
+
+source(here::here(glue::glue("{subproj}/multiome_analysis/misc/paths.R")))
+source(here::here("utils/bin.R"))
+
+"{qc}/{robj_dir}/doublet_projects/{patient}" %>%
+  glue::glue() %>%
+  here::here() %>%
+  dir.create(path = .,
+             showWarnings = FALSE,
+             recursive = TRUE)
+set.seed(0)
+```
+
+# Load data
+
+```{r}
+seurat_obj <- readRDS(here::here(glue::glue("{qc}/{robj_dir}/2.2_{patient}.rds")))
+```
+
+# Create arrowfile and project
+
+```{r eval=F, include=F}
+frag_path <- Fragments(seurat_obj@assays$ATAC)[[1]]@path
+spl <- strsplit(frag_path, "/")
+half_fp <- paste(spl[[1]][6:length(spl[[1]])], collapse="/")
+inputFiles <- paste0("/scratch_isilon/groups/singlecell/isentis", half_fp)
+```
+
+```{r eval=T}
+seurat_obj <- change_frag_path(seurat_obj, "ATAC")
+inputFiles <- Fragments(seurat_obj@assays$ATAC)[[1]]@path
+names(inputFiles) <- patient
+```
+
+```{r eval=T}
+addArchRGenome("hg38")
+addArchRThreads(threads = 10) 
+```
+
+```{r eval=T}
+ArrowFiles <- createArrowFiles(
+  inputFiles = inputFiles,
+  sampleNames = names(inputFiles),
+  minTSS = 1, #Dont set this too high because you can always increase later
+  minFrags = 1000, 
+  addTileMat = TRUE,
+  addGeneScoreMat = TRUE,
+  excludeChr = c("chrM", "chrY")
+)
+```
+
+
+Create an ArchR project with the arrow files
+```{r eval=T}
+ArrowFiles <- glue::glue("{patient}.arrow")
+out_dir <- here::here(glue::glue("{qc}/{robj_dir}/doublet_projects/{patient}"))
+
+pj <- ArchRProject(
+  ArrowFiles = ArrowFiles, 
+  outputDirectory = out_dir,
+  copyArrows = TRUE # This is recommended so that if you modify the Arrow files you have an original copy for later usage.
+)
+```
+
+# Filter low quality cells
+
+```{r include=F, eval=F}
+pj <- loadArchRProject(here::here(glue::glue("{qc}/{robj_dir}/doublet_projects/{patient}")))
+```
+
+
+Filter cells that have already been filtered before (keep good quality cell barcodes from Seurat)
+```{r eval=T}
+bc <- colnames(seurat_obj)
+bc <- paste(patient, bc, sep="#")
+bc_p <- rownames(getCellColData(pj))
+table(bc %in% bc_p)
+```
+
+```{r eval=T}
+bc <- bc[bc %in% bc_p]
+pj_filt <- pj[bc, ]
+```
+
+
+# Estimate doublets
+
+```{r eval=T}
+pj_filt <- addDoubletScores(
+  input = pj_filt,
+  k = 10, # Refers to how many cells near a "pseudo-doublet" to count.
+  knnMethod = "UMAP", # Refers to the embedding to use for nearest neighbor search.
+  LSIMethod = 1)
+```
+
+```{r eval=T}
+df_dbl <- getCellColData(pj_filt)
+
+df_dbl <- df_dbl %>%  
+  data.frame %>%
+  tibble::rownames_to_column("barcodes")
+```
+
+# Save
+
+```{r eval=T}
+write_csv(df_dbl, path = here::here(glue::glue("{qc}/{robj_dir}/doublet_projects/{patient}/dbl_archr.csv")))
+```
+
+```{r eval=T}
+out_dir <- here::here(glue::glue("{qc}/{robj_dir}/doublet_projects/{patient}"))
+saveArchRProject(
+  ArchRProj = pj_filt,
+  outputDirectory = out_dir,
+  load = FALSE,
+  dropCells = TRUE)
+```
+
+```{r eval=T}
+# move intermediate folders to corresponding arch project
+out_list <- Sys.glob(file.path(here::here("scripts/multiome"), glue::glue("QualityControl")))
+print(length(out_list))
+for (f in out_list) {
+  splited <- str_split(f, "/")[[1]]
+  filename <- rev(splited)[1]
+  file.rename(f,
+             here::here(glue::glue("{qc}/{robj_dir}/doublet_projects/{patient}/{filename}"))) 
+}
+```
+
+```{r eval=T}
+# move intermediate folders to corresponding arch project
+out_list <- Sys.glob(file.path(here::here("scripts/multiome"), glue::glue("ArchRLogs")))
+print(length(out_list))
+for (f in out_list) {
+  splited <- str_split(f, "/")[[1]]
+  filename <- rev(splited)[1]
+  file.rename(f,
+             here::here(glue::glue("{qc}/{robj_dir}/doublet_projects/{patient}/{filename}"))) 
+}
+```
+
+# Add information to metadata
+
+```{r include=T, eval=T}
+df_dbl <- read_csv(here::here(glue::glue("{qc}/{robj_dir}/doublet_projects/{patient}/dbl_archr.csv")))
+```
+
+```{r include=T, eval=T}
+df_dbl <- df_dbl %>% 
+  mutate(orig.barcode = gsub(glue::glue("{patient}#"), "", barcodes)) 
+
+df_meta <- seurat_obj@meta.data
+df_meta$orig.barcode <- rownames(df_meta)
+
+df_meta <- merge(df_meta, df_dbl, all=TRUE)
+```
+
+```{r include=T, eval=T}
+sum(is.na(df_meta$DoubletScore))
+```
+
+```{r include=T, eval=T}
+seurat_obj@meta.data$doublet_score_atac <- df_meta$DoubletScore
+seurat_obj@meta.data$doublet_enrichment_atac <- df_meta$DoubletEnrichment
+```
+
+```{r fig.height = 6, fig.width = 14, out.width = "100%", include=F, eval=F}
+FeaturePlot(seurat_obj, 
+            features = c("doublet_score_atac", "doublet_score"), 
+            reduction = "umap.atac", ncol=2)
+```
+
+```{r fig.height = 6, fig.width = 14, out.width = "100%", include=F, eval=F}
+FeaturePlot(seurat_obj, 
+            features = c("doublet_score_atac", "doublet_score"), 
+            reduction = "wnn.umap", ncol=2)
+```
+
+```{r fig.height = 6, fig.width = 8, out.width = "100%",  include=F, eval=F}
+DimPlot(seurat_obj, reduction = "wnn.umap", label = T) + NoLegend()
+```
+
+```{r fig.height = 6, fig.width = 8, out.width = "100%",  include=F, eval=F}
+DimPlot(seurat_obj, reduction = "umap.atac", label = T) + NoLegend()
+```
+
+```{r include=T, eval=T}
+saveRDS(seurat_obj, here::here(glue::glue("{qc}/{robj_dir}/2.3_{patient}.rds")))
+```
+
+
+# Session
+
+```{r}
+sessionInfo()
+```

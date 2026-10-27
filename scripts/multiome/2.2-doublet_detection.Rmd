@@ -1,0 +1,92 @@
+---
+title: "2.2-Doublet detection with Scrublet"
+author: "Inés Sentís"
+date: "10/28/2021"
+output:
+  html_document:
+    toc: yes
+    toc_float: yes
+    number_sections: yes
+    df_print: paged
+params:
+  subproj: "Default!"
+---
+
+
+# Introduction
+
+We are going run scrublet for doublet detection
+
+# Libraries
+
+```{r}
+library(Signac)
+library(Seurat)
+library(tidyverse)
+library(rscrublet)
+library(Matrix)
+```
+
+# Parameters
+
+```{r}
+subproj <- params$subproj
+
+source(here::here(glue::glue("{subproj}/multiome_analysis/misc/paths.R")))
+set.seed(0)
+```
+
+# Functions
+
+```{r}
+
+# Piece of code from https://github.com/Single-Cell-Genomics-Group-CNAG-CRG/scripts_and_utils/blob/main/run_scrublet.R
+# function to run R scrublet on a Seurat object
+# assumes you have RNA counts on your object (@assays$RNA@counts)
+# returns the same Seurat object with a "doublet_score" metadata column and 
+# also the prediction as logical in "doublet_pred" metadata column
+# expected doublet rate from [10x Multiome tables](https://www.epfl.ch/research/facilities/gene-expression-core-facility/wp-content/uploads/2021/04/Multiome-10XG-samples-preparation-guidelines-by-GECF-vA.01.pdf)
+
+# remotes::install_github("huyuem/rscrublet")
+
+run_scrublet <- function(seu_obj){
+  count_matrix = as.matrix(seu_obj@assays$RNA@counts)
+  scrr = scrubDoublets(count_matrix,
+                        expected_doublet_rate=0.035,
+                        min_counts=2, 
+                        min_cells=3, 
+                        min_gene_variability_pctl=85, 
+                        n_prin_comps=30)
+
+  seu_obj$doublet_score = scrr$doublet_scores_obs
+  seu_obj$doublet_pred = scrr$scrubDoublets
+  seu_obj
+}
+```
+
+# Load data
+
+```{r}
+df_info <- read_csv(here::here(glue::glue("utils/info_samples.csv")))
+df_info <- df_info %>% 
+  dplyr::filter(modality =="multiome" & subproject == subproj & quality != "Bad")
+
+df_info <- unique(df_info[, c("gem_id", "patient")])
+```
+
+```{r}
+list_objects <- lapply(df_info$patient, function(id) {
+  obj <- readRDS(here::here(glue::glue("{qc}/{robj_dir}/2.1_{id}.rds")))
+  obj <- run_scrublet(obj)
+  file.rename('histogram of doublet scores.pdf', here::here(glue::glue("{qc}/{plt_dir}/2.2_histogram_scrublet_{id}.pdf")))
+  print(id)
+  saveRDS(obj, here::here(glue::glue("{qc}/{robj_dir}/2.2_{id}.rds")))
+})
+list_objects <- setNames(list_objects, df_info$patient)
+```
+
+# Session Information
+
+```{r}
+sessionInfo()
+```
